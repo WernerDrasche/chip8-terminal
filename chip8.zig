@@ -266,13 +266,22 @@ const VideoRAM = struct {
 
 const Keypad = struct {
     const CYCLES_RETAIN = 240;
+    const CYCLES_COOLDOWN = 20;
 
     queue: [CYCLES_RETAIN]u8 = [_]u8{0} ** CYCLES_RETAIN,
     idx: usize = 0,
+    last_read: u8 = 0,
+    cooldown: usize = 0,
 
     fn readByteToInputQueue(self: *Keypad, reader: anytype) void {
+        if (self.cooldown > 0) {
+            self.cooldown -= 1;
+        }
         self.idx = (self.idx + 1) % CYCLES_RETAIN;
-        self.queue[self.idx] = reader.readByte() catch 0;
+        const byte = reader.readByte() catch 0;
+        if (byte == last_read and cooldown > 0) {
+            byte = 255;
+        }
     }
 
     fn readByteFromInputQueue(self: *Keypad) ?u8 {
@@ -280,7 +289,13 @@ const Keypad = struct {
         while (i < CYCLES_RETAIN) : (i += 1) {
             const byte = self.queue[self.idx];
             if (byte != 0) {
-                return if (byte == 255) null else byte;
+                if (byte == 255) {
+                    return null;
+                } else {
+                    self.last_read = byte;
+                    self.cooldown = CYCLES_COOLDOWN;
+                    return byte;
+                }
             }
             if (self.idx == 0) {
                 self.idx = CYCLES_RETAIN;
@@ -638,7 +653,8 @@ fn commandMode(
 }
 
 fn enterRawMode(allocator: Allocator) linux.termios {
-    _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate", "50", "40"}}) catch {};
+    stdout.writeAll("\x1b[?251") catch {};
+    _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate", "20", "200"}}) catch {};
     var tty_attr: linux.termios = undefined;
     _ = linux.tcgetattr(linux.STDIN_FILENO, &tty_attr);
     const tty_attr_bak = tty_attr;
@@ -650,6 +666,7 @@ fn enterRawMode(allocator: Allocator) linux.termios {
 }
 
 fn exitRawMode(tty_attr_bak: *linux.termios, allocator: Allocator) void {
+    stdout.writeAll("\x1b[?25h") catch {};
     _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate"}}) catch {};
     std.os.nanosleep(0, 100000000);
     _ = linux.tcsetattr(linux.STDIN_FILENO, linux.TCSA.NOW, tty_attr_bak);
@@ -679,8 +696,6 @@ pub fn main() !void {
     cpu.loadProgram(args.start_address, args.program);
     var tty_attr_bak = enterRawMode(allocator);
     defer exitRawMode(&tty_attr_bak, allocator);
-    try stdout.writeAll("\x1b[?251");
-    defer stdout.writeAll("\x1b[?25h") catch {};
     var halt = false;
     while (!halt) {
         keypad.readByteToInputQueue(stdin);
