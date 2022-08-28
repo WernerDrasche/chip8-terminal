@@ -13,3 +13,6 @@ commands:
 
 Do not use Ctrl-C to close the program while not in command mode, as the key repeat rate will be messed up and raw mode will still be enabled.
 If you happen to use i3, you can run the python script to launch the interpreter (it will make the window look nicer).
+
+TODO:
+- add sound support
