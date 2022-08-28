@@ -9,6 +9,7 @@ const mem = std.mem;
 const testing = std.testing;
 const log = std.log;
 const linux = std.os.linux;
+const json = std.json;
 
 //TODO: implement sound (no clue how to do that yet)
 
@@ -48,7 +49,9 @@ const Settings = struct {
     default_sleep_nanos: u64 = 2088333,
     map: HashMap(u8, u8),
 
-    fn init(allocator: Allocator) !Settings {
+    error_flag: bool = false,
+
+    fn init(args: Args, allocator: Allocator) !Settings {
         var map = HashMap(u8, u8).init(allocator);
         try map.put('1', 0x1);
         try map.put('2', 0x2);
@@ -65,9 +68,63 @@ const Settings = struct {
         try map.put('d', 0xd);
         try map.put('e', 0xe);
         try map.put('f', 0xf);
-        return Settings{
+        var result = Settings{
             .map = map,
         };
+        const cwd = std.fs.cwd();
+        // max_size is arbitrary
+        const file = cwd.readFileAlloc(allocator, "config.json", 4096) catch {
+            result.error_flag = true;
+            log.warn("couldn't open config.json", .{});
+            return result;
+        };
+        defer allocator.free(file);
+        var parser = json.Parser.init(allocator, false);
+        defer parser.deinit();
+        var tree = try parser.parse(file);
+        defer tree.deinit();
+        const prog_names = [_][]const u8{"default", args.name};
+        for (prog_names) |name| {
+            if (tree.root.Object.get(name)) |default| {
+                if (default.Object.get("sleep_secs")) |val| {
+                    const sleep_secs: u64 = if (val.Integer < 0) blk: {
+                        result.error_flag = true;
+                        log.err("invalid time for sleep_secs", .{});
+                        break :blk result.default_sleep_secs;
+                    } else @intCast(u64, val.Integer);
+                    result.default_sleep_secs = sleep_secs;
+                    result.sleep_secs = sleep_secs;
+                }
+                if (default.Object.get("sleep_nanos")) |val| {
+                    const sleep_nanos = if (val.Integer < 0) blk: {
+                        result.error_flag = true;
+                        log.err("invalid time for sleep_nanos", .{});
+                        break :blk result.default_sleep_nanos;
+                    } else @intCast(u64, val.Integer);
+                    result.default_sleep_nanos = sleep_nanos;
+                    result.sleep_nanos = sleep_nanos;
+                }
+                if (default.Object.get("keymap")) |keymap| {
+                    var iter = keymap.Object.iterator();
+                    while (iter.next()) |entry| {
+                        if (entry.key_ptr.len != 1) {
+                            log.err("invalid length for mapped key", .{});
+                            result.error_flag = true;
+                            continue;
+                        }
+                        const key = entry.key_ptr.ptr[0];
+                        const to_str = entry.value_ptr.String;
+                        const to = std.fmt.parseInt(u8, to_str, 16) catch {
+                            result.error_flag = true;
+                            log.err("could not parse {d}", .{to_str});
+                            continue;
+                        };
+                        try map.put(key, to);
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     fn deinit(self: *Settings) void {
@@ -84,6 +141,13 @@ fn nextNotEmpty(comptime T: type, iterator: *mem.SplitIterator(T)) ?[]const T {
             return slice;
         } 
     } else return null;
+}
+
+fn printMap(writer: anytype, map: anytype) !void {
+    var iter = map.iterator();
+    while (iter.next()) |entry| {
+        try writer.print("{c} -> {x}\n", .{entry.key_ptr.*, entry.value_ptr.*});
+    }
 }
 
 const VideoRAM = struct {
@@ -400,7 +464,7 @@ const Chip8CPU = struct {
                     0x0a => {
                         while (true) {
                             const press = Keypad.getPressed(reader) catch blk: {
-                                if (try commandMode(reader, writer, canonical_term, allocator)) {
+                                if (try commandMode(reader, writer, canonical_term, self.video, allocator)) {
                                     return true;
                                 } else {
                                     break :blk null;
@@ -451,6 +515,7 @@ const Chip8CPU = struct {
 const Args = struct {
     start_address: u16,
     program: []u8,
+    name: []const u8,
     allocator: Allocator,
 
     fn collect(allocator: Allocator) !Args {
@@ -466,11 +531,16 @@ const Args = struct {
                 filename = arg;
             }
         }
+        const dot_ind = if (mem.indexOf(u8, filename, ".")) |ind| ind else filename.len;
+        const basename = filename[0..dot_ind];
+        var name = try allocator.alloc(u8, basename.len);
+        mem.copy(u8, name, basename);
         const max_size = Chip8CPU.MEM_SIZE - start_address;
         const program = try cwd.readFileAlloc(allocator, filename, max_size);
         return Args{
             .start_address = start_address,
             .program = program,
+            .name = name,
             .allocator = allocator,
         };
     }
@@ -484,6 +554,7 @@ fn commandMode(
     reader: anytype,
     writer: anytype,
     canonical_term: *linux.termios,
+    video: *VideoRAM,
     allocator: Allocator,
 ) !bool {
     var buf: [100]u8 = undefined;
@@ -540,6 +611,19 @@ fn commandMode(
             };
             try settings.map.put(key, to);
             err_msg = "";
+        } else if (mem.eql(u8, command, "view")) {
+            const obj = nextNotEmpty(u8, &iter) orelse continue;
+            if (mem.eql(u8, obj, "keymap")) {
+                try printMap(writer, settings.map);
+            } else if (mem.eql(u8, obj, "sleep_nanos")) {
+                try writer.print("{d}\n", .{settings.sleep_nanos});
+            } else if (mem.eql(u8, obj, "sleep_secs")) {
+                try writer.print("{d}\n", .{settings.sleep_secs});
+            } else {
+                err_msg = "setting doesn't exist";
+                continue;
+            }
+            err_msg = "";
         } else if (mem.eql(u8, command, "exit")) {
             return true;
         } else if (mem.eql(u8, command, "resume")) {
@@ -549,7 +633,7 @@ fn commandMode(
             continue;
         }
     }
-    try VideoRAM.moveCursorHome(writer);
+    try video.drawScreen(writer);
     return false;
 }
 
@@ -575,10 +659,16 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     var rng = std.rand.DefaultPrng.init(@intCast(u64, std.time.milliTimestamp())).random();
     const allocator = gpa.allocator();
-    settings = try Settings.init(allocator);
-    defer settings.deinit();
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn().reader();
+    const args = try Args.collect(allocator);
+    defer args.deinit();
+    settings = try Settings.init(args, allocator);
+    defer settings.deinit();
+    if (settings.error_flag) {
+        try stdout.print("press [ENTER] to continue", .{});
+        try stdin.skipUntilDelimiterOrEof('\n');
+    }
     var vram = VideoRAM.init();
     try vram.drawScreen(stdout);
     var keypad = Keypad{};
@@ -586,8 +676,6 @@ pub fn main() !void {
     defer cpu.deinit();
     try cpu.startCounters();
     defer cpu.stopCounters();
-    const args = try Args.collect(allocator);
-    defer args.deinit();
     cpu.loadProgram(args.start_address, args.program);
     var tty_attr_bak = enterRawMode(allocator);
     defer exitRawMode(&tty_attr_bak, allocator);
@@ -599,7 +687,7 @@ pub fn main() !void {
         if (keypad.readByteFromInputQueue()) |byte| {
             if (byte == 0x1b) {
                 keypad.consumeKeypress();
-                halt = try commandMode(stdin, stdout, &tty_attr_bak, allocator);
+                halt = try commandMode(stdin, stdout, &tty_attr_bak, &vram, allocator);
             }
         }
         halt = cpu.stepInstruction(stdin, stdout, &tty_attr_bak, allocator) catch blk: {
