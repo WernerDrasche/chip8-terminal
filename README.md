@@ -1,4 +1,4 @@
-![pong]{pong.png}
+![pong](pong.png)
 This is a barely functional linux-only chip8 interpreter for the terminal.
 The config file gives an example of how to configure keybindings and speed settings for each game.
 All settings visible in the config file can be changed in command mode.
