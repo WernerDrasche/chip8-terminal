@@ -649,7 +649,7 @@ fn commandMode(
 }
 
 fn enterRawMode(allocator: Allocator) linux.termios {
-    _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate", "50"}}) catch {};
+    _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate", "100"}}) catch {};
     var tty_attr: linux.termios = undefined;
     _ = linux.tcgetattr(linux.STDIN_FILENO, &tty_attr);
     const tty_attr_bak = tty_attr;

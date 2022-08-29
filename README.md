@@ -7,6 +7,7 @@ To enter command mode press escape.
 commands:
 - exit => exits the program
 - resume => exits command mode
+- restart => restarts the game
 - nanosleep secs nanos => configures nanosleep after every cycle (I am aware that this is not a great solution)
 - remap key to => first parameter is key-pressed and second parameter the hex value of the mapping
 - view setting => view value of specified setting 

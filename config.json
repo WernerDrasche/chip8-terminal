@@ -22,6 +22,7 @@
         }
     },
     "invaders": {
+        "sleep_nanos": 1044166, 
         "keymap": {
             "a": "4",
             "d": "6"
