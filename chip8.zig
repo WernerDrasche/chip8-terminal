@@ -266,22 +266,13 @@ const VideoRAM = struct {
 
 const Keypad = struct {
     const CYCLES_RETAIN = 240;
-    const CYCLES_COOLDOWN = 20;
 
     queue: [CYCLES_RETAIN]u8 = [_]u8{0} ** CYCLES_RETAIN,
     idx: usize = 0,
-    last_read: u8 = 0,
-    cooldown: usize = 0,
 
-    fn readByteToInputQueue(self: *Keypad, reader: anytype) void {
-        if (self.cooldown > 0) {
-            self.cooldown -= 1;
-        }
+    fn readByteToInputQueue(self: *Keypad, reader: anytype) !void {
         self.idx = (self.idx + 1) % CYCLES_RETAIN;
-        const byte = reader.readByte() catch 0;
-        if (byte == last_read and cooldown > 0) {
-            byte = 255;
-        }
+        self.queue[self.idx] = reader.readByte() catch 0;
     }
 
     fn readByteFromInputQueue(self: *Keypad) ?u8 {
@@ -289,13 +280,7 @@ const Keypad = struct {
         while (i < CYCLES_RETAIN) : (i += 1) {
             const byte = self.queue[self.idx];
             if (byte != 0) {
-                if (byte == 255) {
-                    return null;
-                } else {
-                    self.last_read = byte;
-                    self.cooldown = CYCLES_COOLDOWN;
-                    return byte;
-                }
+                return if (byte == 255) null else byte;
             }
             if (self.idx == 0) {
                 self.idx = CYCLES_RETAIN;
@@ -406,7 +391,7 @@ const Chip8CPU = struct {
         writer: anytype,
         canonical_term: *linux.termios,
         allocator: Allocator,
-    ) !bool {
+    ) !State {
         const instruction = blk: {
             var result: u16 = self.mem[self.ip];
             result <<= 8;
@@ -427,7 +412,7 @@ const Chip8CPU = struct {
                 switch (suffix2) {
                     0xe0 => try self.video.clear(writer),
                     0xee => self.ip = self.stack.pop(),
-                    0xfd => return true,
+                    0xfd => return .halt,
                     else => return error.UnknownInstruction,
                 }
             },
@@ -479,8 +464,9 @@ const Chip8CPU = struct {
                     0x0a => {
                         while (true) {
                             const press = Keypad.getPressed(reader) catch blk: {
-                                if (try commandMode(reader, writer, canonical_term, self.video, allocator)) {
-                                    return true;
+                                const state = try commandMode(reader, writer, canonical_term, self.video, allocator);
+                                if (state != .ok) {
+                                    return state;
                                 } else {
                                     break :blk null;
                                 }
@@ -523,7 +509,7 @@ const Chip8CPU = struct {
             else => return error.UnknownInstruction,
         }
         _ = suffix1;
-        return false;
+        return .ok;
     }
 };
 
@@ -565,13 +551,19 @@ const Args = struct {
     }
 };
 
+const State = enum {
+    ok,
+    halt,
+    restart,
+};
+
 fn commandMode(
     reader: anytype,
     writer: anytype,
     canonical_term: *linux.termios,
     video: *VideoRAM,
     allocator: Allocator,
-) !bool {
+) !State {
     var buf: [100]u8 = undefined;
     const parse_err_msg: []const u8 = "not a valid integer";
     const invalid_err_msg: []const u8 = "invalid command";
@@ -634,13 +626,17 @@ fn commandMode(
                 try writer.print("{d}\n", .{settings.sleep_nanos});
             } else if (mem.eql(u8, obj, "sleep_secs")) {
                 try writer.print("{d}\n", .{settings.sleep_secs});
+                
             } else {
                 err_msg = "setting doesn't exist";
                 continue;
             }
             err_msg = "";
         } else if (mem.eql(u8, command, "exit")) {
-            return true;
+            return .halt;
+        } else if (mem.eql(u8, command, "restart")) {
+            log.debug("restarting", .{});
+            return .restart;
         } else if (mem.eql(u8, command, "resume")) {
             log.debug("resuming", .{});
             break;
@@ -649,12 +645,11 @@ fn commandMode(
         }
     }
     try video.drawScreen(writer);
-    return false;
+    return .ok;
 }
 
 fn enterRawMode(allocator: Allocator) linux.termios {
-    stdout.writeAll("\x1b[?251") catch {};
-    _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate", "20", "200"}}) catch {};
+    _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate", "50"}}) catch {};
     var tty_attr: linux.termios = undefined;
     _ = linux.tcgetattr(linux.STDIN_FILENO, &tty_attr);
     const tty_attr_bak = tty_attr;
@@ -666,7 +661,6 @@ fn enterRawMode(allocator: Allocator) linux.termios {
 }
 
 fn exitRawMode(tty_attr_bak: *linux.termios, allocator: Allocator) void {
-    stdout.writeAll("\x1b[?25h") catch {};
     _ = std.ChildProcess.exec(.{.allocator=allocator, .argv=&[_][]const u8{"xset", "r", "rate"}}) catch {};
     std.os.nanosleep(0, 100000000);
     _ = linux.tcsetattr(linux.STDIN_FILENO, linux.TCSA.NOW, tty_attr_bak);
@@ -696,19 +690,30 @@ pub fn main() !void {
     cpu.loadProgram(args.start_address, args.program);
     var tty_attr_bak = enterRawMode(allocator);
     defer exitRawMode(&tty_attr_bak, allocator);
-    var halt = false;
-    while (!halt) {
-        keypad.readByteToInputQueue(stdin);
+    var status: State = .ok;
+    while (status == .ok) {
+        try keypad.readByteToInputQueue(stdin);
         if (keypad.readByteFromInputQueue()) |byte| {
             if (byte == 0x1b) {
                 keypad.consumeKeypress();
-                halt = try commandMode(stdin, stdout, &tty_attr_bak, &vram, allocator);
+                status = try commandMode(stdin, stdout, &tty_attr_bak, &vram, allocator);
             }
         }
-        halt = cpu.stepInstruction(stdin, stdout, &tty_attr_bak, allocator) catch blk: {
-            try stdout.print("{}", .{cpu});
-            break :blk true;
-        } or halt;
-        std.os.nanosleep(settings.sleep_secs, settings.sleep_nanos);
+        switch (status) {
+            .ok => {
+                status = cpu.stepInstruction(stdin, stdout, &tty_attr_bak, allocator) catch blk: {
+                    try stdout.print("{}", .{cpu});
+                    break :blk .halt;
+                };
+                std.os.nanosleep(settings.sleep_secs, settings.sleep_nanos);
+            },
+            .restart => {
+                cpu.loadProgram(args.start_address, args.program);
+                try vram.clear(stdout);
+                try vram.drawScreen(stdout);
+                status = .ok;
+            },
+            else => {},
+        }
     }
 }
